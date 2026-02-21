@@ -736,6 +736,89 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             edges.append((src, tgt))
         return edges if edges else None
 
+    # ── type-based node query ───────────────────────────────────────────
+
+    @READ_RETRY
+    async def get_node_from_types(self, type_list) -> list[dict]:
+        """Return all nodes whose entity_type is in *type_list*."""
+        await self._ensure_session()
+        if not type_list:
+            return []
+        resp = await _request(
+            self._session, self._base_url, "POST",
+            f"{self._nodes_index}/_search",
+            body={
+                "query": {"terms": {"entity_type": list(type_list)}},
+                "size": 10000,
+            },
+        )
+        node_list = []
+        for hit in resp.get("hits", {}).get("hits", []):
+            props = hit["_source"].get("properties", {})
+            node_list.append({**props, "entity_name": hit["_id"]})
+        return node_list
+
+    # ── k-hop traversal ────────────────────────────────────────────────
+
+    async def _get_edges_for_node(self, node_id: str) -> list[tuple[str, str]]:
+        """Return list of (source, target) edges connected to node_id."""
+        resp = await _request(
+            self._session, self._base_url, "POST",
+            f"{self._edges_index}/_search",
+            body={
+                "query": {
+                    "bool": {
+                        "should": [
+                            {"term": {"source": node_id}},
+                            {"term": {"target": node_id}},
+                        ],
+                        "minimum_should_match": 1,
+                    }
+                },
+                "size": 10000,
+                "_source": ["source", "target"],
+            },
+        )
+        edges = []
+        for hit in resp.get("hits", {}).get("hits", []):
+            src = hit["_source"]["source"]
+            tgt = hit["_source"]["target"]
+            edges.append((src, tgt))
+        return edges
+
+    async def get_neighbors_within_k_hops(
+        self, source_node_id: str, k: int
+    ) -> list[tuple]:
+        """BFS traversal returning paths (as tuples of node IDs) up to k hops.
+
+        Matches the NetworkX implementation's behavior.
+        """
+        await self._ensure_session()
+        if not await self.has_node(source_node_id):
+            return []
+
+        from ..utils import merge_tuples
+
+        # Hop 1: direct edges from source
+        edges = await self._get_edges_for_node(source_node_id)
+        source_edge = [(source_node_id, tgt if src == source_node_id else src)
+                       for src, tgt in edges]
+
+        count = 1
+        while count < k:
+            count += 1
+            import copy
+            sc_edge = copy.deepcopy(source_edge)
+            source_edge = []
+            for pair in sc_edge:
+                last_node = pair[-1]
+                append_edges = await self._get_edges_for_node(last_node)
+                append_tuples = [(last_node, tgt if src == last_node else src)
+                                 for src, tgt in append_edges]
+                for t in merge_tuples([pair], append_tuples):
+                    source_edge.append(t)
+        return source_edge
+
     # ── lifecycle ────────────────────────────────────────────────────────
 
     async def index_done_callback(self) -> None:
@@ -855,35 +938,44 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
                 found[doc["_id"]] = source
         return [found.get(id) for id in ids]
 
-    @READ_RETRY
-    async def filter_keys(self, data: list[str]) -> set[str]:
-        await self._ensure_session()
-        if not data:
-            return set()
-        resp = await _request(
-            self._session, self._base_url, "POST",
-            f"{self._index_name}/_mget", body={"ids": list(data)},
-        )
-        existing = set()
-        for doc in resp.get("docs", []):
-            if doc.get("found"):
-                existing.add(doc["_id"])
-        return set(data) - existing
-
     @WRITE_RETRY
     async def upsert(self, data: dict[str, dict]) -> None:
         await self._ensure_session()
         if not data:
             return
+        # Serialize enum values to strings for JSON storage
         actions = []
         for k, v in data.items():
             doc = dict(v)
             doc.pop("_id", None)
+            for field_name, field_val in doc.items():
+                if isinstance(field_val, DocStatus):
+                    doc[field_name] = field_val.value
             actions.append(json.dumps({"index": {"_id": k}}))
             actions.append(json.dumps(doc))
-        await _bulk_ndjson(
-            self._session, self._base_url, self._index_name, actions
-        )
+        # Use refresh=true so data is immediately searchable
+        body_str = "\n".join(actions) + "\n"
+        url = f"{self._base_url}/{self._index_name}/_bulk?refresh=true"
+        async with self._session.post(
+            url,
+            data=body_str,
+            headers={"Content-Type": "application/x-ndjson"},
+        ) as resp:
+            text = await resp.text()
+            try:
+                result = json.loads(text)
+            except json.JSONDecodeError:
+                result = {"_raw": text}
+        if result.get("errors"):
+            failed = [
+                item
+                for item in result.get("items", [])
+                if "error" in item.get("index", {})
+            ]
+            if failed:
+                logger.error(
+                    f"Bulk DocStatus upsert had {len(failed)} errors: {failed[:3]}"
+                )
 
     @WRITE_RETRY
     async def drop(self) -> None:
@@ -901,6 +993,33 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
             self._session, self._base_url, "POST",
             f"{self._index_name}/_refresh",
         )
+
+    @READ_RETRY
+    async def filter_keys(self, data) -> set[str]:
+        """Return keys that should be processed (not in storage or not successfully processed)."""
+        await self._ensure_session()
+        if not data:
+            return set()
+        data_list = list(data)
+        resp = await _request(
+            self._session, self._base_url, "POST",
+            f"{self._index_name}/_mget",
+            body={
+                "docs": [
+                    {"_id": k, "_source": ["status"]} for k in data_list
+                ]
+            },
+        )
+        result = set()
+        for i, doc in enumerate(resp.get("docs", [])):
+            key = data_list[i]
+            if not doc.get("found"):
+                result.add(key)
+            else:
+                status = doc.get("_source", {}).get("status")
+                if status != DocStatus.PROCESSED.value:
+                    result.add(key)
+        return result
 
     # ── DocStatus-specific queries ───────────────────────────────────────
 
@@ -929,43 +1048,40 @@ class OpenSearchDocStatusStorage(DocStatusStorage):
         return counts
 
     @READ_RETRY
-    async def get_failed_docs(self) -> dict[str, DocProcessingStatus]:
+    async def get_docs_by_status(
+        self, status: DocStatus
+    ) -> dict[str, DocProcessingStatus]:
+        """Get all documents with a specific status."""
         await self._ensure_session()
         resp = await _request(
             self._session, self._base_url, "POST",
             f"{self._index_name}/_search",
             body={
-                "query": {"term": {"status": "failed"}},
+                "query": {"term": {"status": status.value}},
                 "size": 10000,
             },
         )
         result: dict[str, DocProcessingStatus] = {}
         for hit in resp.get("hits", {}).get("hits", []):
             try:
-                result[hit["_id"]] = DocProcessingStatus(**hit["_source"])
-            except (KeyError, TypeError) as e:
+                data = hit["_source"].copy()
+                # If content is missing, use content_summary as content
+                if "content" not in data and "content_summary" in data:
+                    data["content"] = data["content_summary"]
+                # Convert status string to DocStatus enum
+                if "status" in data and isinstance(data["status"], str):
+                    data["status"] = DocStatus(data["status"])
+                # Remove fields not in DocProcessingStatus
+                data.pop("_status", None)
+                result[hit["_id"]] = DocProcessingStatus(**data)
+            except (KeyError, TypeError, ValueError) as e:
                 logger.error(
                     f"Missing required field for doc {hit['_id']}: {e}"
                 )
         return result
 
-    @READ_RETRY
+    async def get_failed_docs(self) -> dict[str, DocProcessingStatus]:
+        return await self.get_docs_by_status(DocStatus.FAILED)
+
     async def get_pending_docs(self) -> dict[str, DocProcessingStatus]:
-        await self._ensure_session()
-        resp = await _request(
-            self._session, self._base_url, "POST",
-            f"{self._index_name}/_search",
-            body={
-                "query": {"term": {"status": "pending"}},
-                "size": 10000,
-            },
-        )
-        result: dict[str, DocProcessingStatus] = {}
-        for hit in resp.get("hits", {}).get("hits", []):
-            try:
-                result[hit["_id"]] = DocProcessingStatus(**hit["_source"])
-            except (KeyError, TypeError) as e:
-                logger.error(
-                    f"Missing required field for doc {hit['_id']}: {e}"
-                )
-        return result
+        return await self.get_docs_by_status(DocStatus.PENDING)
