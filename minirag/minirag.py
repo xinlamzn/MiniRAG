@@ -63,6 +63,10 @@ STORAGES = {
     "WeaviateKVStorage": ".kg.weaviate_impl",
     "WeaviateGraphStorage": ".kg.weaviate_impl",
     "run_sync": ".kg.weaviate_impl",
+    "OpenSearchKVStorage": ".kg.opensearch_impl",
+    "OpenSearchVectorStorage": ".kg.opensearch_impl",
+    "OpenSearchGraphStorage": ".kg.opensearch_impl",
+    "OpenSearchDocStatusStorage": ".kg.opensearch_impl",
 }
 
 # future KG integrations
