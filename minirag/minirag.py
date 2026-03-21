@@ -358,11 +358,15 @@ class MiniRAG:
             ids = [ids]
 
         await self.apipeline_enqueue_documents(input, ids)
-        await self.apipeline_process_enqueue_documents(
+        newly_processed = await self.apipeline_process_enqueue_documents(
             split_by_character, split_by_character_only
         )
 
-        # Perform additional entity extraction as per original ainsert logic
+        # Only extract entities from the documents just processed in this call,
+        # not all historically processed documents.
+        if not newly_processed:
+            newly_processed = set()
+
         inserting_chunks = {
             compute_mdhash_id(dp["content"], prefix="chunk-"): {
                 **dp,
@@ -371,6 +375,7 @@ class MiniRAG:
             for doc_id, status_doc in (
                 await self.doc_status.get_docs_by_status(DocStatus.PROCESSED)
             ).items()
+            if doc_id in newly_processed
             for dp in self.chunking_func(
                 status_doc.content,
                 self.chunk_overlap_token_size,
@@ -456,11 +461,13 @@ class MiniRAG:
         self,
         split_by_character: str | None = None,
         split_by_character_only: bool = False,
-    ) -> None:
+    ) -> set[str]:
         """
         Process pending documents by splitting them into chunks, processing
         each chunk for entity and relation extraction, and updating the
         document status.
+
+        Returns the set of doc IDs that were processed in this call.
         """
         processing_docs, failed_docs, pending_docs = await asyncio.gather(
             self.doc_status.get_docs_by_status(DocStatus.PROCESSING),
@@ -475,8 +482,9 @@ class MiniRAG:
         }
         if not to_process_docs:
             logger.info("No documents to process")
-            return
+            return set()
 
+        processed_ids = set()
         docs_batches = [
             list(to_process_docs.items())[i : i + self.max_parallel_insert]
             for i in range(0, len(to_process_docs), self.max_parallel_insert)
@@ -515,7 +523,9 @@ class MiniRAG:
                         }
                     }
                 )
+                processed_ids.add(doc_id)
         logger.info("Document processing pipeline completed")
+        return processed_ids
 
     async def _insert_done(self):
         tasks = []
