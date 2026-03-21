@@ -55,18 +55,22 @@ async def _os_request(session, method, path, body=None):
 
 
 async def _delete_test_indices(session):
-    """Delete all minirag_pytest_* indices."""
+    """Delete all minirag_pytest* indices and graph plugin databases."""
     status, data = await _os_request(
         session, "GET", "_cat/indices?h=index&format=json"
     )
     if isinstance(data, list):
         for idx in data:
             name = idx.get("index", "")
-            if name.startswith("minirag_pytest_"):
+            if name.startswith("minirag_pytest"):
                 await _os_request(session, "DELETE", name)
+    # Also delete graph plugin database
+    from minirag.kg.opensearch_impl import _graph_database_name
+    db_name = _graph_database_name()
+    await _os_request(session, "DELETE", f"_plugins/_graph/database/{db_name}")
 
 
-async def _refresh(session, pattern="minirag_pytest_*"):
+async def _refresh(session, pattern="minirag_pytest*"):
     await _os_request(session, "POST", f"{pattern}/_refresh")
 
 
@@ -136,9 +140,11 @@ async def vector_storage(os_session):
 @pytest_asyncio.fixture
 async def graph_storage(os_session):
     global_config = {}
+    embed_func = _make_embedding_func()
     storage = OpenSearchGraphStorage(
         namespace="test_graph",
         global_config=global_config,
+        embedding_func=embed_func,
     )
     yield storage
 
@@ -374,30 +380,22 @@ class TestOpenSearchGraphStorage:
         assert edge["relationship"] == "works_at"
 
     @pytest.mark.asyncio
-    async def test_get_edge_symmetric(self, graph_storage):
-        """Edge lookup should work regardless of argument order (sorted key)."""
-        await graph_storage.upsert_edge("AAA", "ZZZ", {"rel": "linked"})
-        await graph_storage.index_done_callback()
-
-        edge_fwd = await graph_storage.get_edge("AAA", "ZZZ")
-        edge_rev = await graph_storage.get_edge("ZZZ", "AAA")
-        assert edge_fwd is not None
-        assert edge_rev is not None
-        assert edge_fwd["rel"] == edge_rev["rel"]
-
-    @pytest.mark.asyncio
     async def test_has_edge(self, graph_storage):
+        await graph_storage.upsert_node("X", {"entity_type": "T"})
+        await graph_storage.upsert_node("Y", {"entity_type": "T"})
         assert await graph_storage.has_edge("X", "Y") is False
 
         await graph_storage.upsert_edge("X", "Y", {"rel": "test"})
         await graph_storage.index_done_callback()
 
         assert await graph_storage.has_edge("X", "Y") is True
-        assert await graph_storage.has_edge("Y", "X") is True  # symmetric
 
     @pytest.mark.asyncio
     async def test_node_degree(self, graph_storage):
         await graph_storage.upsert_node("CENTER", {"entity_type": "THING"})
+        await graph_storage.upsert_node("N1", {"entity_type": "THING"})
+        await graph_storage.upsert_node("N2", {"entity_type": "THING"})
+        await graph_storage.upsert_node("N3", {"entity_type": "THING"})
         await graph_storage.upsert_edge("CENTER", "N1", {"rel": "a"})
         await graph_storage.upsert_edge("CENTER", "N2", {"rel": "b"})
         await graph_storage.upsert_edge("CENTER", "N3", {"rel": "c"})
@@ -408,6 +406,10 @@ class TestOpenSearchGraphStorage:
 
     @pytest.mark.asyncio
     async def test_edge_degree(self, graph_storage):
+        await graph_storage.upsert_node("P", {"entity_type": "T"})
+        await graph_storage.upsert_node("Q", {"entity_type": "T"})
+        await graph_storage.upsert_node("R", {"entity_type": "T"})
+        await graph_storage.upsert_node("S", {"entity_type": "T"})
         await graph_storage.upsert_edge("P", "Q", {"rel": "x"})
         await graph_storage.upsert_edge("P", "R", {"rel": "y"})
         await graph_storage.upsert_edge("Q", "S", {"rel": "z"})
@@ -419,6 +421,9 @@ class TestOpenSearchGraphStorage:
 
     @pytest.mark.asyncio
     async def test_get_node_edges(self, graph_storage):
+        await graph_storage.upsert_node("HUB", {"entity_type": "T"})
+        await graph_storage.upsert_node("SPOKE1", {"entity_type": "T"})
+        await graph_storage.upsert_node("SPOKE2", {"entity_type": "T"})
         await graph_storage.upsert_edge("HUB", "SPOKE1", {"rel": "a"})
         await graph_storage.upsert_edge("HUB", "SPOKE2", {"rel": "b"})
         await graph_storage.index_done_callback()
@@ -455,6 +460,7 @@ class TestOpenSearchGraphStorage:
     @pytest.mark.asyncio
     async def test_delete_node(self, graph_storage):
         await graph_storage.upsert_node("DEL_NODE", {"entity_type": "TEMP"})
+        await graph_storage.upsert_node("OTHER", {"entity_type": "TEMP"})
         await graph_storage.upsert_edge("DEL_NODE", "OTHER", {"rel": "link"})
         await graph_storage.index_done_callback()
 
@@ -522,14 +528,6 @@ class TestOpenSearchGraphStorage:
     async def test_get_neighbors_missing_node(self, graph_storage):
         result = await graph_storage.get_neighbors_within_k_hops("GHOST", 2)
         assert result == []
-
-    @pytest.mark.asyncio
-    async def test_edge_id_is_deterministic(self, graph_storage):
-        """The sorted edge ID should be the same regardless of argument order."""
-        eid1 = graph_storage._edge_id("ZZZ", "AAA")
-        eid2 = graph_storage._edge_id("AAA", "ZZZ")
-        assert eid1 == eid2
-        assert eid1 == "AAA::ZZZ"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -748,7 +746,9 @@ class TestOpenSearchCrossStore:
         vec = OpenSearchVectorStorage(
             namespace="entities", global_config=gc, embedding_func=embed_func
         )
-        graph = OpenSearchGraphStorage(namespace="graph", global_config=gc)
+        graph = OpenSearchGraphStorage(
+            namespace="graph", global_config=gc, embedding_func=embed_func
+        )
         doc = OpenSearchDocStatusStorage(
             namespace="docstatus", global_config=gc, embedding_func=embed_func
         )
@@ -768,14 +768,17 @@ class TestOpenSearchCrossStore:
         # Verify indices exist
         status, data = await _os_request(
             os_session, "GET",
-            "_cat/indices/minirag_pytest_*?h=index&format=json",
+            "_cat/indices/minirag_pytest*?h=index&format=json",
         )
         index_names = {idx["index"] for idx in data}
         assert "minirag_pytest_kv_full_docs" in index_names
         assert "minirag_pytest_vec_entities" in index_names
-        assert "minirag_pytest_graph_nodes" in index_names
-        assert "minirag_pytest_graph_edges" in index_names
         assert "minirag_pytest_docstatus" in index_names
+        # Graph plugin creates {database}-lpg-nodes and {database}-lpg-edges
+        from minirag.kg.opensearch_impl import _graph_database_name
+        db_name = _graph_database_name()
+        assert f"{db_name}-lpg-nodes" in index_names
+        assert f"{db_name}-lpg-edges" in index_names
 
     @pytest.mark.asyncio
     async def test_index_naming_uses_database_prefix(self, os_session):

@@ -84,31 +84,36 @@ async def os_request(session, method, path, json_body=None):
 
 
 async def cleanup_indices(session):
-    """Delete all minirag_test_* indices."""
+    """Delete all minirag_test_* indices and graph plugin databases."""
     print("=== Cleaning up previous test indices ===")
     _, data = await os_request(session, "GET", "_cat/indices?h=index&format=json")
     if isinstance(data, list):
         for idx in data:
             name = idx.get("index", "")
-            if name.startswith("minirag_test_"):
+            if name.startswith("minirag_test"):
                 status, _ = await os_request(session, "DELETE", name)
                 print(f"  Deleted index: {name} -> {status}")
+    # Also delete graph plugin database
+    from minirag.kg.opensearch_impl import _graph_database_name
+    db_name = _graph_database_name()
+    status, _ = await os_request(session, "DELETE", f"_plugins/_graph/database/{db_name}")
+    print(f"  Deleted graph database: {db_name} -> {status}")
 
 
 async def refresh_all(session):
-    """Refresh all minirag_test_* indices so doc counts are accurate."""
-    await os_request(session, "POST", "minirag_test_*/_refresh")
+    """Refresh all minirag_test* indices so doc counts are accurate."""
+    await os_request(session, "POST", "minirag_test*/_refresh")
 
 
 async def check_indices(session):
-    """Print doc counts for all minirag_test_* indices."""
+    """Print doc counts for all minirag_test* indices (including graph plugin)."""
     print("\n=== Phase 2: Verifying OpenSearch indices ===")
     await refresh_all(session)
     _, data = await os_request(
-        session, "GET", "_cat/indices/minirag_test_*?h=index,docs.count&format=json"
+        session, "GET", "_cat/indices/minirag_test*?h=index,docs.count&format=json"
     )
     if not isinstance(data, list) or not data:
-        print("  ERROR: No minirag_test_ indices found!")
+        print("  ERROR: No minirag_test indices found!")
         return False
     for idx in sorted(data, key=lambda x: x.get("index", "")):
         print(f"  {idx['index']}: {idx.get('docs.count', '?')} docs")
@@ -116,26 +121,32 @@ async def check_indices(session):
 
 
 async def check_graph(session):
-    """Print sample graph nodes and edges."""
+    """Print sample graph nodes and edges via Cypher."""
     print("\n=== Phase 4: Checking graph data ===")
-    await refresh_all(session)
-    for idx_name in ["minirag_test_graph_nodes", "minirag_test_graph_edges"]:
-        status, data = await os_request(
-            session, "POST", f"{idx_name}/_search",
-            json_body={"size": 5, "_source": True},
-        )
-        if status != 200:
-            print(f"  {idx_name}: not found or empty")
-            continue
-        total = data.get("hits", {}).get("total", {}).get("value", 0)
-        print(f"  {idx_name}: {total} documents")
-        for hit in data.get("hits", {}).get("hits", [])[:3]:
-            doc = hit["_source"]
-            doc_id = hit["_id"]
-            if "entity_type" in doc:
-                print(f"    Node: {doc_id} (type={doc.get('entity_type', '?')})")
-            elif "source" in doc and "target" in doc:
-                print(f"    Edge: {doc['source']} -> {doc['target']}")
+    from minirag.kg.opensearch_impl import _graph_database_name
+    db_name = _graph_database_name()
+    # Count nodes
+    status, data = await os_request(
+        session, "POST", "_plugins/_cypher",
+        json_body={"query": "MATCH (n:Entity) RETURN count(n) AS cnt", "database": db_name},
+    )
+    cnt = data.get("data", [{}])[0].get("cnt", 0) if status == 200 else "?"
+    print(f"  Graph nodes: {cnt}")
+    # Count edges
+    status, data = await os_request(
+        session, "POST", "_plugins/_cypher",
+        json_body={"query": "MATCH ()-[r:DIRECTED]->() RETURN count(r) AS cnt", "database": db_name},
+    )
+    cnt = data.get("data", [{}])[0].get("cnt", 0) if status == 200 else "?"
+    print(f"  Graph edges: {cnt}")
+    # Sample nodes
+    status, data = await os_request(
+        session, "POST", "_plugins/_cypher",
+        json_body={"query": "MATCH (n:Entity) RETURN n.entity_id AS eid, n.entity_type AS t LIMIT 5", "database": db_name},
+    )
+    if status == 200:
+        for row in data.get("data", []):
+            print(f"    Node: {row.get('eid')} (type={row.get('t', '?')})")
 
 
 async def main():

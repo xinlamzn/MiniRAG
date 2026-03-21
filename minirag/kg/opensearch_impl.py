@@ -483,184 +483,248 @@ class OpenSearchVectorStorage(BaseVectorStorage):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Graph storage backend using OpenSearch (pure REST, no Cypher)
+# Graph storage backend using OpenSearch Graph Plugin (Cypher interface)
 # ═══════════════════════════════════════════════════════════════════════════
 
 
-GRAPH_NODES_MAPPING = {
-    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
-    "mappings": {
-        "properties": {
-            "id": {"type": "keyword"},
-            "entity_type": {"type": "keyword"},
-            "properties": {"type": "flat_object"},
-        }
-    },
-}
+def _create_os_client():
+    """Create an AsyncOpenSearch client from OPENSEARCH_* env vars."""
+    import ssl as _ssl
+    uri = os.environ.get("OPENSEARCH_URI", "https://localhost:9200")
+    username = os.environ.get("OPENSEARCH_USERNAME", "admin")
+    password = os.environ.get("OPENSEARCH_PASSWORD", "")
+    verify_certs = os.environ.get("OPENSEARCH_VERIFY_CERTS", "true").lower() in (
+        "true", "1", "yes",
+    )
+    use_ssl = uri.startswith("https")
 
-GRAPH_EDGES_MAPPING = {
-    "settings": {"number_of_shards": 1, "number_of_replicas": 0},
-    "mappings": {
-        "properties": {
-            "id": {"type": "keyword"},
-            "source": {"type": "keyword"},
-            "target": {"type": "keyword"},
-            "properties": {"type": "flat_object"},
-        }
-    },
-}
+    ssl_context = None
+    if use_ssl and not verify_certs:
+        ssl_context = _ssl.create_default_context()
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = _ssl.CERT_NONE
+
+    from opensearchpy import AsyncOpenSearch
+    return AsyncOpenSearch(
+        hosts=[uri.rstrip("/")],
+        http_auth=(username, password) if username else None,
+        use_ssl=use_ssl,
+        verify_certs=verify_certs,
+        ssl_context=ssl_context,
+        ssl_show_warn=False,
+        timeout=30,
+        max_retries=3,
+        retry_on_timeout=True,
+    )
+
+
+def _graph_database_name() -> str:
+    """Build graph plugin database name from OPENSEARCH_DATABASE env var."""
+    import hashlib as _hl, re as _re
+    raw = os.environ.get("OPENSEARCH_DATABASE", "minirag")
+    name = _re.sub(r"[^a-z0-9_-]", "_", raw.lower()).lstrip("_-") or "g"
+    if name[0].isdigit():
+        name = "g" + name
+    suffix = _hl.sha256(raw.encode()).hexdigest()[:8]
+    return f"{name}-{suffix}"
 
 
 @dataclass
 class OpenSearchGraphStorage(BaseGraphStorage):
+    """Graph storage using the OpenSearch Graph Plugin with Cypher queries.
 
-    _session: aiohttp.ClientSession = field(default=None, repr=False, init=False)
-    _base_url: str = field(default="", repr=False, init=False)
-    _nodes_index: str = field(default="", repr=False, init=False)
-    _edges_index: str = field(default="", repr=False, init=False)
-    _initialized: bool = field(default=False, repr=False, init=False)
+    All node/edge operations go through ``POST _plugins/_cypher``.
+    The plugin manages two underlying indices automatically:
+    ``{database}-lpg-nodes`` and ``{database}-lpg-edges``.
+    """
+
+    _client: Any = field(default=None, repr=False, init=False)
+    _database_name: str = field(default="", repr=False, init=False)
+    _database_ready: bool = field(default=False, repr=False, init=False)
 
     def __post_init__(self):
-        database = _get_database()
-        self._nodes_index = f"{database}_graph_nodes"
-        self._edges_index = f"{database}_graph_edges"
+        self._database_name = _graph_database_name()
 
-    async def _ensure_session(self):
-        if self._initialized:
-            return
-        self._base_url, self._session = _create_os_session()
-        await _ensure_index(
-            self._session, self._base_url, self._nodes_index, GRAPH_NODES_MAPPING
-        )
-        await _ensure_index(
-            self._session, self._base_url, self._edges_index, GRAPH_EDGES_MAPPING
-        )
-        logger.info(
-            f"OpenSearch graph storage ready at {self._base_url} "
-            f"(nodes={self._nodes_index}, edges={self._edges_index})"
-        )
-        self._initialized = True
+    # ── Cypher execution ─────────────────────────────────────────────────
+
+    async def _execute_cypher(self, query: str, params: dict | None = None) -> dict:
+        """Execute a Cypher query against the graph plugin endpoint."""
+        import asyncio as _aio
+        body: dict[str, Any] = {"query": query, "database": self._database_name}
+        if params:
+            body["parameters"] = params
+        for attempt in range(3):
+            try:
+                return await self._client.transport.perform_request(
+                    "POST", "/_plugins/_cypher", body=body
+                )
+            except Exception as e:
+                if attempt < 2:
+                    await _aio.sleep(2 ** attempt)
+                else:
+                    logger.error(f"Cypher failed after 3 attempts: {e}\nQuery: {query}")
+                    raise
 
     @staticmethod
-    def _edge_id(src: str, tgt: str) -> str:
-        """Sorted pair key for idempotent undirected edge upserts."""
-        a, b = sorted([src, tgt])
-        return f"{a}::{b}"
+    def _rows(resp: dict) -> list[list]:
+        """Normalise Cypher response to positional row lists."""
+        columns = resp.get("columns", [])
+        data = resp.get("data", [])
+        if not columns or not data:
+            return []
+        return [[item.get(col) for col in columns] for item in data]
+
+    # ── Database lifecycle ───────────────────────────────────────────────
+
+    async def _ensure_session(self):
+        if self._database_ready:
+            return
+        if self._client is None:
+            self._client = _create_os_client()
+        # Create graph database if it doesn't exist
+        dim = self.embedding_func.embedding_dim if self.embedding_func else 1024
+        db_body = {
+            "embedding": {
+                "dimension": dim, "field": "embedding",
+                "engine": "faiss", "space_type": "cosinesimil",
+            },
+            "schema": {
+                "nodes": {
+                    "entity_id": {"type": "keyword"},
+                    "entity_type": {"type": "keyword"},
+                    "description": {"type": "text"},
+                },
+                "edges": {
+                    "weight": {"type": "float"},
+                    "description": {"type": "text"},
+                    "keywords": {"type": "text"},
+                },
+                "strict": False,
+            },
+        }
+        try:
+            await self._client.transport.perform_request(
+                "PUT", f"/_plugins/_graph/database/{self._database_name}", body=db_body,
+            )
+            logger.info(f"Created graph database: {self._database_name}")
+        except Exception as e:
+            err = str(e).lower()
+            if "already exists" in err or "already_exists" in err or "resource_already_exists" in err:
+                logger.debug(f"Graph database already exists: {self._database_name}")
+            else:
+                raise
+        self._database_ready = True
+        logger.info(f"OpenSearch graph plugin storage ready (db={self._database_name})")
 
     # ── get_types ────────────────────────────────────────────────────────
 
-    @READ_RETRY
     async def get_types(self) -> tuple[list[str], list[str]]:
         await self._ensure_session()
-        resp = await _request(
-            self._session, self._base_url, "POST",
-            f"{self._nodes_index}/_search",
-            body={
-                "size": 0,
-                "aggs": {
-                    "entity_types": {
-                        "terms": {"field": "entity_type", "size": 10000}
-                    }
-                },
-            },
-        )
-        buckets = (
-            resp.get("aggregations", {})
-            .get("entity_types", {})
-            .get("buckets", [])
-        )
-        original = [b["key"] for b in buckets]
-        lowered = [t.lower() for t in original]
-        return lowered, original
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity) RETURN DISTINCT n.entity_type AS t"
+            )
+            original = [r[0] for r in self._rows(resp) if r[0]]
+            lowered = [t.lower() for t in original]
+            return lowered, original
+        except Exception:
+            return [], []
 
     # ── node CRUD ────────────────────────────────────────────────────────
 
-    @READ_RETRY
     async def has_node(self, node_id: str) -> bool:
         await self._ensure_session()
-        resp = await _request(
-            self._session, self._base_url, "HEAD",
-            f"{self._nodes_index}/_doc/{node_id}",
-        )
-        return resp.get("_status") == 200
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity {entity_id: $id}) RETURN count(n) > 0 AS exists",
+                {"id": node_id},
+            )
+            rows = self._rows(resp)
+            return bool(rows[0][0]) if rows else False
+        except Exception:
+            return False
 
-    @READ_RETRY
     async def get_node(self, node_id: str) -> Union[dict, None]:
         await self._ensure_session()
-        resp = await _request(
-            self._session, self._base_url, "GET",
-            f"{self._nodes_index}/_doc/{node_id}",
-        )
-        if not resp.get("found"):
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity {entity_id: $id}) RETURN properties(n) AS props",
+                {"id": node_id},
+            )
+            rows = self._rows(resp)
+            if rows and rows[0][0]:
+                props = rows[0][0]
+                props.pop("embedding", None)
+                return props
             return None
-        return resp["_source"].get("properties", {})
+        except Exception:
+            return None
 
-    @WRITE_RETRY
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
         await self._ensure_session()
-        entity_type = node_data.get("entity_type", "UNKNOWN")
-        doc = {
-            "id": node_id,
-            "entity_type": entity_type,
-            "properties": node_data,
-        }
-        await _request(
-            self._session, self._base_url, "PUT",
-            f"{self._nodes_index}/_doc/{node_id}", body=doc,
+        node_id = node_id.lstrip("-").strip()
+        if not node_id:
+            return
+        props = {k: v for k, v in node_data.items() if k not in ("_id", "embedding")}
+        props["entity_id"] = node_id
+        import re as _re
+        entity_type = node_data.get("entity_type", "")
+        label_clause = ""
+        if entity_type:
+            safe_type = _re.sub(r"[^a-zA-Z0-9_]", "_", entity_type)
+            label_clause = f", n:`{safe_type}`"
+        await self._execute_cypher(
+            f"MERGE (n:Entity {{entity_id: $id}}) "
+            f"ON CREATE SET n += $props{label_clause} "
+            f"ON MATCH SET n += $props{label_clause}",
+            {"id": node_id, "props": props},
         )
+        # Refresh so subsequent MERGEs can find this node
+        try:
+            await self._client.indices.refresh(index=f"{self._database_name}-lpg-nodes")
+        except Exception:
+            pass
 
-    @WRITE_RETRY
     async def delete_node(self, node_id: str) -> None:
         await self._ensure_session()
-        # Delete connected edges first
-        await _request(
-            self._session, self._base_url, "POST",
-            f"{self._edges_index}/_delete_by_query",
-            body={
-                "query": {
-                    "bool": {
-                        "should": [
-                            {"term": {"source": node_id}},
-                            {"term": {"target": node_id}},
-                        ],
-                        "minimum_should_match": 1,
-                    }
-                }
-            },
-        )
-        # Delete the node itself
-        await _request(
-            self._session, self._base_url, "DELETE",
-            f"{self._nodes_index}/_doc/{node_id}",
-        )
+        try:
+            await self._execute_cypher(
+                "MATCH (n:Entity {entity_id: $id}) DETACH DELETE n",
+                {"id": node_id},
+            )
+        except Exception as e:
+            logger.error(f"Error deleting node {node_id}: {e}")
 
     # ── edge CRUD ────────────────────────────────────────────────────────
 
-    @READ_RETRY
     async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
         await self._ensure_session()
-        edge_id = self._edge_id(source_node_id, target_node_id)
-        resp = await _request(
-            self._session, self._base_url, "HEAD",
-            f"{self._edges_index}/_doc/{edge_id}",
-        )
-        return resp.get("_status") == 200
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (a:Entity {entity_id: $src})-[r:DIRECTED]->(b:Entity {entity_id: $tgt}) "
+                "RETURN count(r) > 0 AS exists",
+                {"src": source_node_id, "tgt": target_node_id},
+            )
+            rows = self._rows(resp)
+            return bool(rows[0][0]) if rows else False
+        except Exception:
+            return False
 
-    @READ_RETRY
     async def get_edge(
         self, source_node_id: str, target_node_id: str
     ) -> Union[dict, None]:
         await self._ensure_session()
-        edge_id = self._edge_id(source_node_id, target_node_id)
-        resp = await _request(
-            self._session, self._base_url, "GET",
-            f"{self._edges_index}/_doc/{edge_id}",
-        )
-        if not resp.get("found"):
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (a:Entity {entity_id: $src})-[r:DIRECTED]->(b:Entity {entity_id: $tgt}) "
+                "RETURN properties(r) AS props LIMIT 1",
+                {"src": source_node_id, "tgt": target_node_id},
+            )
+            rows = self._rows(resp)
+            return rows[0][0] if rows else None
+        except Exception:
             return None
-        return resp["_source"].get("properties", {})
 
-    @WRITE_RETRY
     async def upsert_edge(
         self,
         source_node_id: str,
@@ -668,153 +732,127 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         edge_data: dict[str, str],
     ) -> None:
         await self._ensure_session()
-        edge_id = self._edge_id(source_node_id, target_node_id)
-        doc = {
-            "id": edge_id,
-            "source": source_node_id,
-            "target": target_node_id,
-            "properties": edge_data,
-        }
-        await _request(
-            self._session, self._base_url, "PUT",
-            f"{self._edges_index}/_doc/{edge_id}", body=doc,
+        source_node_id = source_node_id.lstrip("-").strip()
+        target_node_id = target_node_id.lstrip("-").strip()
+        if not source_node_id or not target_node_id:
+            return
+        props = {k: v for k, v in edge_data.items() if k != "_id"}
+        if "weight" in props:
+            try:
+                props["weight"] = float(props["weight"])
+            except (ValueError, TypeError):
+                props["weight"] = 1.0
+        params = {"src": source_node_id, "tgt": target_node_id, "props": props}
+        # Check existence first (MERGE on edges is O(E) in the graph plugin)
+        resp = await self._execute_cypher(
+            "MATCH (s:Entity {entity_id: $src})-[r:DIRECTED]->(t:Entity {entity_id: $tgt}) "
+            "RETURN count(r) AS cnt", params,
         )
+        exists = resp.get("data", [{}])[0].get("cnt", 0) > 0
+        if exists:
+            await self._execute_cypher(
+                "MATCH (s:Entity {entity_id: $src})-[r:DIRECTED]->(t:Entity {entity_id: $tgt}) "
+                "SET r += $props", params,
+            )
+        else:
+            # CREATE + SET split: graph plugin drops SET in same statement as CREATE
+            await self._execute_cypher(
+                "MATCH (s:Entity {entity_id: $src}), (t:Entity {entity_id: $tgt}) "
+                "CREATE (s)-[r:DIRECTED]->(t)", params,
+            )
+            if props:
+                await self._execute_cypher(
+                    "MATCH (s:Entity {entity_id: $src})-[r:DIRECTED]->(t:Entity {entity_id: $tgt}) "
+                    "SET r += $props", params,
+                )
 
     # ── degree / traversal ───────────────────────────────────────────────
 
-    @READ_RETRY
     async def node_degree(self, node_id: str) -> int:
         await self._ensure_session()
-        resp = await _request(
-            self._session, self._base_url, "POST",
-            f"{self._edges_index}/_count",
-            body={
-                "query": {
-                    "bool": {
-                        "should": [
-                            {"term": {"source": node_id}},
-                            {"term": {"target": node_id}},
-                        ],
-                        "minimum_should_match": 1,
-                    }
-                }
-            },
-        )
-        return resp.get("count", 0)
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity {entity_id: $id})-[r:DIRECTED]-() "
+                "RETURN count(r) AS degree",
+                {"id": node_id},
+            )
+            rows = self._rows(resp)
+            return int(rows[0][0]) if rows else 0
+        except Exception:
+            return 0
 
     async def edge_degree(self, src_id: str, tgt_id: str) -> int:
-        src_degree = await self.node_degree(src_id)
-        tgt_degree = await self.node_degree(tgt_id)
-        return src_degree + tgt_degree
+        return await self.node_degree(src_id) + await self.node_degree(tgt_id)
 
-    @READ_RETRY
     async def get_node_edges(
         self, source_node_id: str
     ) -> Union[list[tuple[str, str]], None]:
         await self._ensure_session()
-        resp = await _request(
-            self._session, self._base_url, "POST",
-            f"{self._edges_index}/_search",
-            body={
-                "query": {
-                    "bool": {
-                        "should": [
-                            {"term": {"source": source_node_id}},
-                            {"term": {"target": source_node_id}},
-                        ],
-                        "minimum_should_match": 1,
-                    }
-                },
-                "size": 10000,
-                "_source": ["source", "target"],
-            },
-        )
-        edges = []
-        for hit in resp.get("hits", {}).get("hits", []):
-            src = hit["_source"]["source"]
-            tgt = hit["_source"]["target"]
-            edges.append((src, tgt))
-        return edges if edges else None
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity {entity_id: $id})-[r:DIRECTED]-(c:Entity) "
+                "RETURN n.entity_id AS src, c.entity_id AS tgt",
+                {"id": source_node_id},
+            )
+            rows = self._rows(resp)
+            return [(r[0], r[1]) for r in rows] if rows else None
+        except Exception:
+            return None
 
     # ── type-based node query ───────────────────────────────────────────
 
-    @READ_RETRY
     async def get_node_from_types(self, type_list) -> list[dict]:
         """Return all nodes whose entity_type is in *type_list*."""
         await self._ensure_session()
         if not type_list:
             return []
-        resp = await _request(
-            self._session, self._base_url, "POST",
-            f"{self._nodes_index}/_search",
-            body={
-                "query": {"terms": {"entity_type": list(type_list)}},
-                "size": 10000,
-            },
-        )
-        node_list = []
-        for hit in resp.get("hits", {}).get("hits", []):
-            props = hit["_source"].get("properties", {})
-            node_list.append({**props, "entity_name": hit["_id"]})
-        return node_list
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (n:Entity) WHERE n.entity_type IN $types "
+                "RETURN n.entity_id AS eid, properties(n) AS props",
+                {"types": list(type_list)},
+            )
+            result = []
+            for row in self._rows(resp):
+                props = row[1] or {}
+                props.pop("embedding", None)
+                result.append({**props, "entity_name": row[0]})
+            return result
+        except Exception:
+            return []
 
     # ── k-hop traversal ────────────────────────────────────────────────
-
-    async def _get_edges_for_node(self, node_id: str) -> list[tuple[str, str]]:
-        """Return list of (source, target) edges connected to node_id."""
-        resp = await _request(
-            self._session, self._base_url, "POST",
-            f"{self._edges_index}/_search",
-            body={
-                "query": {
-                    "bool": {
-                        "should": [
-                            {"term": {"source": node_id}},
-                            {"term": {"target": node_id}},
-                        ],
-                        "minimum_should_match": 1,
-                    }
-                },
-                "size": 10000,
-                "_source": ["source", "target"],
-            },
-        )
-        edges = []
-        for hit in resp.get("hits", {}).get("hits", []):
-            src = hit["_source"]["source"]
-            tgt = hit["_source"]["target"]
-            edges.append((src, tgt))
-        return edges
 
     async def get_neighbors_within_k_hops(
         self, source_node_id: str, k: int
     ) -> list[tuple]:
-        """BFS traversal returning paths (as tuples of node IDs) up to k hops.
-
-        Matches the NetworkX implementation's behavior.
-        """
+        """BFS traversal returning paths (as tuples of node IDs) up to k hops."""
         await self._ensure_session()
         if not await self.has_node(source_node_id):
             return []
 
         from ..utils import merge_tuples
+        import copy
 
-        # Hop 1: direct edges from source
-        edges = await self._get_edges_for_node(source_node_id)
-        source_edge = [(source_node_id, tgt if src == source_node_id else src)
-                       for src, tgt in edges]
+        # Hop 1: direct neighbours
+        edges = await self.get_node_edges(source_node_id) or []
+        source_edge = [
+            (source_node_id, tgt if src == source_node_id else src)
+            for src, tgt in edges
+        ]
 
         count = 1
         while count < k:
             count += 1
-            import copy
             sc_edge = copy.deepcopy(source_edge)
             source_edge = []
             for pair in sc_edge:
                 last_node = pair[-1]
-                append_edges = await self._get_edges_for_node(last_node)
-                append_tuples = [(last_node, tgt if src == last_node else src)
-                                 for src, tgt in append_edges]
+                append_edges = await self.get_node_edges(last_node) or []
+                append_tuples = [
+                    (last_node, tgt if src == last_node else src)
+                    for src, tgt in append_edges
+                ]
                 for t in merge_tuples([pair], append_tuples):
                     source_edge.append(t)
         return source_edge
@@ -823,14 +861,14 @@ class OpenSearchGraphStorage(BaseGraphStorage):
 
     async def index_done_callback(self) -> None:
         await self._ensure_session()
-        await _request(
-            self._session, self._base_url, "POST",
-            f"{self._nodes_index}/_refresh",
-        )
-        await _request(
-            self._session, self._base_url, "POST",
-            f"{self._edges_index}/_refresh",
-        )
+        try:
+            await self._client.indices.refresh(index=f"{self._database_name}-lpg-nodes")
+        except Exception:
+            pass
+        try:
+            await self._client.indices.refresh(index=f"{self._database_name}-lpg-edges")
+        except Exception:
+            pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
