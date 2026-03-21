@@ -26,7 +26,7 @@ os.environ["OPENSEARCH_DATABASE"] = "minirag_test"
 os.environ.setdefault("AWS_DEFAULT_REGION", "us-west-2")
 
 # ── Models ───────────────────────────────────────────────────────────────────
-BEDROCK_LLM_MODEL = "anthropic.claude-3-5-sonnet-20241022-v2:0"
+BEDROCK_LLM_MODEL = "us.anthropic.claude-sonnet-4-20250514-v1:0"
 BEDROCK_EMBED_MODEL = "amazon.titan-embed-text-v2:0"
 TITAN_V2_DIM = 1024
 
@@ -142,11 +142,12 @@ async def check_graph(session):
     # Sample nodes
     status, data = await os_request(
         session, "POST", "_plugins/_cypher",
-        json_body={"query": "MATCH (n:Entity) RETURN n.entity_id AS eid, n.entity_type AS t LIMIT 5", "database": db_name},
+        json_body={"query": "MATCH (n:Entity) RETURN properties(n) AS props LIMIT 5", "database": db_name},
     )
     if status == 200:
         for row in data.get("data", []):
-            print(f"    Node: {row.get('eid')} (type={row.get('t', '?')})")
+            props = row.get("props", {})
+            print(f"    Node: {props.get('entity_id', '?')} (type={props.get('entity_type', '?')})")
 
 
 async def main():

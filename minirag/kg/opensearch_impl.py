@@ -547,6 +547,11 @@ class OpenSearchGraphStorage(BaseGraphStorage):
 
     # ── Cypher execution ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _clean_id(node_id: str) -> str:
+        """Strip surrounding quotes and leading hyphens from node IDs."""
+        return node_id.strip().strip('"').lstrip("-").strip()
+
     async def _execute_cypher(self, query: str, params: dict | None = None) -> dict:
         """Execute a Cypher query against the graph plugin endpoint."""
         import asyncio as _aio
@@ -611,6 +616,9 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             err = str(e).lower()
             if "already exists" in err or "already_exists" in err or "resource_already_exists" in err:
                 logger.debug(f"Graph database already exists: {self._database_name}")
+            elif "creation failed" in err:
+                # Graph plugin returns 500 "Creation failed" when DB already exists
+                logger.debug(f"Graph database likely already exists: {self._database_name}")
             else:
                 raise
         self._database_ready = True
@@ -637,7 +645,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         try:
             resp = await self._execute_cypher(
                 "MATCH (n:Entity {entity_id: $id}) RETURN count(n) > 0 AS exists",
-                {"id": node_id},
+                {"id": self._clean_id(node_id)},
             )
             rows = self._rows(resp)
             return bool(rows[0][0]) if rows else False
@@ -649,7 +657,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         try:
             resp = await self._execute_cypher(
                 "MATCH (n:Entity {entity_id: $id}) RETURN properties(n) AS props",
-                {"id": node_id},
+                {"id": self._clean_id(node_id)},
             )
             rows = self._rows(resp)
             if rows and rows[0][0]:
@@ -662,13 +670,17 @@ class OpenSearchGraphStorage(BaseGraphStorage):
 
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
         await self._ensure_session()
-        node_id = node_id.lstrip("-").strip()
+        node_id = self._clean_id(node_id)
         if not node_id:
             return
-        props = {k: v for k, v in node_data.items() if k not in ("_id", "embedding")}
+        props = {}
+        for k, v in node_data.items():
+            if k in ("_id", "embedding"):
+                continue
+            props[k] = v.strip('"') if isinstance(v, str) else v
         props["entity_id"] = node_id
         import re as _re
-        entity_type = node_data.get("entity_type", "")
+        entity_type = props.get("entity_type", "")
         label_clause = ""
         if entity_type:
             safe_type = _re.sub(r"[^a-zA-Z0-9_]", "_", entity_type)
@@ -690,7 +702,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         try:
             await self._execute_cypher(
                 "MATCH (n:Entity {entity_id: $id}) DETACH DELETE n",
-                {"id": node_id},
+                {"id": self._clean_id(node_id)},
             )
         except Exception as e:
             logger.error(f"Error deleting node {node_id}: {e}")
@@ -703,7 +715,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             resp = await self._execute_cypher(
                 "MATCH (a:Entity {entity_id: $src})-[r:DIRECTED]->(b:Entity {entity_id: $tgt}) "
                 "RETURN count(r) > 0 AS exists",
-                {"src": source_node_id, "tgt": target_node_id},
+                {"src": self._clean_id(source_node_id), "tgt": self._clean_id(target_node_id)},
             )
             rows = self._rows(resp)
             return bool(rows[0][0]) if rows else False
@@ -718,7 +730,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             resp = await self._execute_cypher(
                 "MATCH (a:Entity {entity_id: $src})-[r:DIRECTED]->(b:Entity {entity_id: $tgt}) "
                 "RETURN properties(r) AS props LIMIT 1",
-                {"src": source_node_id, "tgt": target_node_id},
+                {"src": self._clean_id(source_node_id), "tgt": self._clean_id(target_node_id)},
             )
             rows = self._rows(resp)
             return rows[0][0] if rows else None
@@ -732,11 +744,15 @@ class OpenSearchGraphStorage(BaseGraphStorage):
         edge_data: dict[str, str],
     ) -> None:
         await self._ensure_session()
-        source_node_id = source_node_id.lstrip("-").strip()
-        target_node_id = target_node_id.lstrip("-").strip()
+        source_node_id = self._clean_id(source_node_id)
+        target_node_id = self._clean_id(target_node_id)
         if not source_node_id or not target_node_id:
             return
-        props = {k: v for k, v in edge_data.items() if k != "_id"}
+        props = {}
+        for k, v in edge_data.items():
+            if k == "_id":
+                continue
+            props[k] = v.strip('"') if isinstance(v, str) else v
         if "weight" in props:
             try:
                 props["weight"] = float(props["weight"])
@@ -774,7 +790,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             resp = await self._execute_cypher(
                 "MATCH (n:Entity {entity_id: $id})-[r:DIRECTED]-() "
                 "RETURN count(r) AS degree",
-                {"id": node_id},
+                {"id": self._clean_id(node_id)},
             )
             rows = self._rows(resp)
             return int(rows[0][0]) if rows else 0
@@ -792,7 +808,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
             resp = await self._execute_cypher(
                 "MATCH (n:Entity {entity_id: $id})-[r:DIRECTED]-(c:Entity) "
                 "RETURN n.entity_id AS src, c.entity_id AS tgt",
-                {"id": source_node_id},
+                {"id": self._clean_id(source_node_id)},
             )
             rows = self._rows(resp)
             return [(r[0], r[1]) for r in rows] if rows else None
