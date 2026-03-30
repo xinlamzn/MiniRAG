@@ -386,13 +386,15 @@ class MiniRAG:
 
         if inserting_chunks:
             logger.info("Performing entity extraction on newly processed chunks")
+            gc = asdict(self)
+            gc["llm_response_cache"] = self.llm_response_cache
             await extract_entities(
                 inserting_chunks,
                 knowledge_graph_inst=self.chunk_entity_relation_graph,
                 entity_vdb=self.entities_vdb,
                 entity_name_vdb=self.entity_name_vdb,
                 relationships_vdb=self.relationships_vdb,
-                global_config=asdict(self),
+                global_config=gc,
             )
  
         await self._insert_done()
@@ -560,6 +562,8 @@ class MiniRAG:
                 asdict(self),
             )
         elif param.mode == "mini":
+            gc = asdict(self)
+            gc["llm_response_cache"] = self.llm_response_cache
             response = await minirag_query(
                 query,
                 self.chunk_entity_relation_graph,
@@ -570,7 +574,7 @@ class MiniRAG:
                 self.text_chunks,
                 self.embedding_func,
                 param,
-                asdict(self),
+                gc,
             )
         elif param.mode == "naive":
             response = await naive_query(

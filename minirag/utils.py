@@ -63,6 +63,29 @@ def compute_args_hash(*args, cache_type: str | None = None) -> str:
     return md5(args_str.encode()).hexdigest()
 
 
+async def handle_cache(hashing_kv, args_hash, mode="default", cache_type="unknown"):
+    """Check LLM response cache. Returns cached content string or None."""
+    if hashing_kv is None:
+        return None
+    if not hashing_kv.global_config.get("enable_llm_cache"):
+        return None
+    key = f"{mode}:{cache_type}:{args_hash}"
+    entry = await hashing_kv.get_by_id(key)
+    if entry and "return" in entry:
+        return entry["return"]
+    return None
+
+
+async def save_to_cache(hashing_kv, args_hash, content, mode="default", cache_type="unknown"):
+    """Save LLM response to cache."""
+    if hashing_kv is None or not content:
+        return
+    if not hashing_kv.global_config.get("enable_llm_cache"):
+        return
+    key = f"{mode}:{cache_type}:{args_hash}"
+    await hashing_kv.upsert({key: {"return": content}})
+
+
 def clean_text(text: str) -> str:
     """Clean text by removing null bytes (0x00) and whitespace"""
     return text.strip().replace("\x00", "")
@@ -387,8 +410,8 @@ def merge_tuples(list1, list2):
 
 
 def count_elements_in_tuple(tuple_elements, list_elements):
-    sorted_list = sorted(list_elements)
-    tuple_elements = sorted(tuple_elements)
+    sorted_list = sorted(e for e in list_elements if e is not None)
+    tuple_elements = sorted(e for e in tuple_elements if e is not None)
     count = 0
     list_index = 0
 

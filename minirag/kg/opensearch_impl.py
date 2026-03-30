@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any, Optional, Tuple, Union
 
 import aiohttp
+import asyncio
 from tenacity import (
     retry,
     stop_after_attempt,
@@ -80,10 +81,12 @@ def _create_os_session() -> tuple[str, aiohttp.ClientSession]:
         ssl_context = False
 
     connector = aiohttp.TCPConnector(ssl=ssl_context)
+    timeout = aiohttp.ClientTimeout(total=120, connect=10, sock_read=60)
     session = aiohttp.ClientSession(
         auth=auth,
         connector=connector,
         headers={"Content-Type": "application/json"},
+        timeout=timeout,
     )
     return base_url, session
 
@@ -103,6 +106,7 @@ async def _request(
     path: str,
     body: dict | None = None,
     params: dict | None = None,
+    max_retries: int = 2,
 ) -> dict:
     """Issue an HTTP request to OpenSearch and return the JSON response."""
     url = f"{base_url}/{path}"
@@ -111,18 +115,27 @@ async def _request(
         kwargs["json"] = body
     if params is not None:
         kwargs["params"] = params
-    async with session.request(method, url, **kwargs) as resp:
-        text = await resp.text()
-        if resp.status >= 400:
-            logger.error(
-                f"OpenSearch {method} {path} returned {resp.status}: {text}"
-            )
+    last_err = None
+    for attempt in range(max_retries + 1):
         try:
-            result = json.loads(text)
-            result["_status"] = resp.status
-            return result
-        except json.JSONDecodeError:
-            return {"_raw": text, "_status": resp.status}
+            async with session.request(method, url, **kwargs) as resp:
+                text = await resp.text()
+                if resp.status >= 400:
+                    logger.error(
+                        f"OpenSearch {method} {path} returned {resp.status}: {text}"
+                    )
+                try:
+                    result = json.loads(text)
+                    result["_status"] = resp.status
+                    return result
+                except json.JSONDecodeError:
+                    return {"_raw": text, "_status": resp.status}
+        except (asyncio.TimeoutError, aiohttp.ClientError) as e:
+            last_err = e
+            if attempt < max_retries:
+                logger.warning(f"OpenSearch {method} {path} attempt {attempt+1} failed: {e}, retrying...")
+                await asyncio.sleep(1)
+    raise last_err
 
 
 async def _bulk_ndjson(
@@ -621,8 +634,63 @@ class OpenSearchGraphStorage(BaseGraphStorage):
                 logger.debug(f"Graph database likely already exists: {self._database_name}")
             else:
                 raise
+            # Migrate: ensure promoted fields exist on pre-schema databases
+            await self._ensure_promoted_fields(db_body.get("schema", {}))
         self._database_ready = True
         logger.info(f"OpenSearch graph plugin storage ready (db={self._database_name})")
+
+    async def _ensure_promoted_fields(self, schema: dict) -> None:
+        """Add promoted fields to existing indices that lack _meta.schema,
+        then backfill existing documents so promoted top-level fields are populated."""
+        for suffix, key in [("lpg-nodes", "nodes"), ("lpg-edges", "edges")]:
+            fields = schema.get(key, {})
+            if not fields:
+                continue
+            index = f"{self._database_name}-{suffix}"
+            try:
+                mapping = await self._client.indices.get_mapping(index=index)
+                existing = mapping.get(index, {}).get("mappings", {})
+                if existing.get("_meta", {}).get("schema"):
+                    continue  # already has promoted schema
+                # Build PUT mapping body with promoted fields + _meta
+                props = {}
+                for fname, fdef in fields.items():
+                    if isinstance(fdef, dict):
+                        props[fname] = fdef
+                    else:
+                        props[fname] = {"type": fdef}
+                body: dict = {"properties": props}
+                body["_meta"] = {"schema": {key: {f: (d if isinstance(d, str) else d.get("type", "keyword")) for f, d in fields.items()}, "strict": schema.get("strict", False)}}
+                await self._client.indices.put_mapping(index=index, body=body)
+                logger.info(f"Migrated {index}: added promoted fields {list(fields.keys())}")
+                # Backfill: copy properties.X → top-level X for existing docs
+                await self._backfill_promoted_fields(index, list(fields.keys()))
+            except Exception as e:
+                logger.warning(f"Failed to migrate promoted fields for {index}: {e}")
+
+    async def _backfill_promoted_fields(self, index: str, field_names: list[str]) -> None:
+        """Use update_by_query to copy nested properties.* values to top-level promoted fields."""
+        # Build a Painless script that promotes each field
+        lines = []
+        for f in field_names:
+            lines.append(
+                f"if (ctx._source.containsKey('properties') && ctx._source.properties.containsKey('{f}')) "
+                f"{{ ctx._source['{f}'] = ctx._source.properties['{f}']; }}"
+            )
+        script = " ".join(lines)
+        try:
+            resp = await self._client.update_by_query(
+                index=index,
+                body={
+                    "script": {"source": script, "lang": "painless"},
+                    "query": {"match_all": {}},
+                },
+                refresh=True,
+            )
+            updated = resp.get("updated", 0)
+            logger.info(f"Backfilled {updated} docs in {index} with promoted fields {field_names}")
+        except Exception as e:
+            logger.warning(f"Failed to backfill promoted fields for {index}: {e}")
 
     # ── get_types ────────────────────────────────────────────────────────
 

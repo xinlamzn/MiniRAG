@@ -22,6 +22,9 @@ from .utils import (
     compute_mdhash_id,
     calculate_similarity,
     cal_path_score_list,
+    compute_args_hash,
+    handle_cache,
+    save_to_cache,
 )
 from .base import (
     BaseGraphStorage,
@@ -268,23 +271,33 @@ async def extract_entities(
         chunk_dp = chunk_key_dp[1]
         content = chunk_dp["content"]
         hint_prompt = entity_extract_prompt.format(**context_base, input_text=content)
-        final_result = await use_llm_func(hint_prompt)
 
-        history = pack_user_ass_to_openai_messages(hint_prompt, final_result)
-        for now_glean_index in range(entity_extract_max_gleaning):
-            glean_result = await use_llm_func(continue_prompt, history_messages=history)
+        # Check extraction cache
+        hashing_kv = global_config.get("llm_response_cache")
+        extract_hash = compute_args_hash(hint_prompt)
+        cached = await handle_cache(hashing_kv, extract_hash, "default", "extract")
+        if cached:
+            final_result = cached
+        else:
+            final_result = await use_llm_func(hint_prompt)
 
-            history += pack_user_ass_to_openai_messages(continue_prompt, glean_result)
-            final_result += glean_result
-            if now_glean_index == entity_extract_max_gleaning - 1:
-                break
+            history = pack_user_ass_to_openai_messages(hint_prompt, final_result)
+            for now_glean_index in range(entity_extract_max_gleaning):
+                glean_result = await use_llm_func(continue_prompt, history_messages=history)
 
-            if_loop_result: str = await use_llm_func(
-                if_loop_prompt, history_messages=history
-            )
-            if_loop_result = if_loop_result.strip().strip('"').strip("'").lower()
-            if if_loop_result != "yes":
-                break
+                history += pack_user_ass_to_openai_messages(continue_prompt, glean_result)
+                final_result += glean_result
+                if now_glean_index == entity_extract_max_gleaning - 1:
+                    break
+
+                if_loop_result: str = await use_llm_func(
+                    if_loop_prompt, history_messages=history
+                )
+                if_loop_result = if_loop_result.strip().strip('"').strip("'").lower()
+                if if_loop_result != "yes":
+                    break
+
+            await save_to_cache(hashing_kv, extract_hash, final_result, "default", "extract")
 
         records = split_string_by_multi_markers(
             final_result,
@@ -1137,8 +1150,9 @@ async def path2chunk(
                 )
                 text_units = [
                     split_string_by_multi_markers(dp["source_id"], [GRAPH_FIELD_SEP])
-                    for dp in edge_datas  # chunk ID
-                ][0]
+                    for dp in edge_datas if dp is not None  # chunk ID
+                ]
+                text_units = text_units[0] if text_units else []
 
             else:
                 use_edge = []
@@ -1148,6 +1162,8 @@ async def path2chunk(
                 *[knowledge_graph_inst.get_node(pathtuple[0])]
             )
             for dp in node_datas:
+                if dp is None:
+                    continue
                 text_units_node = split_string_by_multi_markers(
                     dp["source_id"], [GRAPH_FIELD_SEP]
                 )
@@ -1158,6 +1174,8 @@ async def path2chunk(
             )
             if query is not None:
                 for dp in node_datas:
+                    if dp is None:
+                        continue
                     text_units_node = split_string_by_multi_markers(
                         dp["source_id"], [GRAPH_FIELD_SEP]
                     )
@@ -1194,6 +1212,8 @@ async def path2chunk(
         if node_chunk_id is None:
             node_datas = await asyncio.gather(*[knowledge_graph_inst.get_node(k)])
             for dp in node_datas:
+                if dp is None:
+                    continue
                 text_units_node = split_string_by_multi_markers(
                     dp["source_id"], [GRAPH_FIELD_SEP]
                 )
@@ -1285,10 +1305,12 @@ async def _build_mini_query_context(
             **candidate_reasoning_path,
             **candidate_reasoning_path_new,
         }
-    for key in candidate_reasoning_path.keys():
-        candidate_reasoning_path[key][
-            "Path"
-        ] = await knowledge_graph_inst.get_neighbors_within_k_hops(key, 2)
+    keys = list(candidate_reasoning_path.keys())
+    all_paths = await asyncio.gather(
+        *[knowledge_graph_inst.get_neighbors_within_k_hops(key, 2) for key in keys]
+    )
+    for key, paths in zip(keys, all_paths):
+        candidate_reasoning_path[key]["Path"] = paths
         imp_ents.append(key)
 
     short_path_entries = {
@@ -1418,11 +1440,19 @@ async def minirag_query(  # MiniRAG
     query_param: QueryParam,
     global_config: dict,
 ) -> str:
+    hashing_kv = global_config.get("llm_response_cache")
     use_model_func = global_config["llm_model_func"]
+
+    # --- keyword extraction (cached) ---
     kw_prompt_temp = PROMPTS["minirag_query2kwd"]
     TYPE_POOL, TYPE_POOL_w_CASE = await knowledge_graph_inst.get_types()
     kw_prompt = kw_prompt_temp.format(query=query, TYPE_POOL=TYPE_POOL)
-    result = await use_model_func(kw_prompt)
+
+    kw_hash = compute_args_hash(kw_prompt)
+    cached_kw = await handle_cache(hashing_kv, kw_hash, query_param.mode, "keywords")
+    result = cached_kw if cached_kw else await use_model_func(kw_prompt)
+    if not cached_kw:
+        await save_to_cache(hashing_kv, kw_hash, result, query_param.mode, "keywords")
 
     try:
         keywords_data = json_repair.loads(result)
@@ -1471,9 +1501,17 @@ async def minirag_query(  # MiniRAG
     sys_prompt = sys_prompt_temp.format(
         context_data=context, response_type=query_param.response_type
     )
+
+    # --- final answer (cached) ---
+    answer_hash = compute_args_hash(query, sys_prompt, query_param.mode)
+    cached_answer = await handle_cache(hashing_kv, answer_hash, query_param.mode, "query")
+    if cached_answer:
+        return cached_answer
+
     response = await use_model_func(
         query,
         system_prompt=sys_prompt,
     )
+    await save_to_cache(hashing_kv, answer_hash, response, query_param.mode, "query")
 
     return response

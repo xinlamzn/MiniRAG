@@ -75,22 +75,25 @@ def make_rag(workingdir):
         graph_storage="OpenSearchGraphStorage",
         doc_status_storage="OpenSearchDocStatusStorage",
         vector_db_storage_cls_kwargs={"cosine_better_than_threshold": 0.2},
-        enable_llm_cache=False,
+        enable_llm_cache=True,
     )
 
 
-async def run_index(rag, datapath):
+async def run_index(rag, datapath, start_from=1):
     txt_files = sorted(
         os.path.join(r, f)
         for r, _, files in os.walk(datapath)
         for f in files if f.endswith(".txt")
     )
-    print(f"\n{'='*60}\nStep 0: Indexing {len(txt_files)} files from {datapath}\n{'='*60}")
+    total = len(txt_files)
+    txt_files = txt_files[start_from - 1:]
+    print(f"\n{'='*60}\nStep 0: Indexing files {start_from}-{total} of {total} from {datapath}\n{'='*60}")
     t0 = time.time()
     for i, fp in enumerate(txt_files):
+        fileno = start_from + i
         with open(fp) as f:
             content = f.read()
-        print(f"[{i+1}/{len(txt_files)}] {os.path.basename(fp)} ({len(content)} chars)")
+        print(f"[{fileno}/{total}] {os.path.basename(fp)} ({len(content)} chars)")
         try:
             await rag.ainsert(content)
         except Exception as e:
@@ -148,13 +151,14 @@ async def main():
     parser.add_argument("--max-queries", type=int, default=0)
     parser.add_argument("--skip-index", action="store_true")
     parser.add_argument("--skip-query", action="store_true")
+    parser.add_argument("--start-from", type=int, default=1, help="Start indexing from file N (1-based)")
     args = parser.parse_args()
 
     rag = make_rag(args.workingdir)
     index_time = query_time = 0
 
     if not args.skip_index:
-        index_time = await run_index(rag, args.datapath)
+        index_time = await run_index(rag, args.datapath, args.start_from)
     if not args.skip_query:
         query_time = await run_query(rag, args.querypath, args.outputpath, args.mode, args.max_queries)
 
