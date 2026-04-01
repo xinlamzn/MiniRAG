@@ -956,6 +956,377 @@ class OpenSearchGraphStorage(BaseGraphStorage):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Docgraph storage backend — document-derived graph mode
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _default_authz_claims() -> dict:
+    """Default authz claims for docgraph ingest (no real auth in MiniRAG)."""
+    return {"backend_roles": ["minirag"]}
+
+
+@dataclass
+class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
+    """Graph storage using the OpenSearch docgraph (document-derived graph) API.
+
+    Uses ``mode: docgraph`` database with evidence model:
+        Document → HAS_CHUNK → Chunk → MENTIONS → Entity
+                                     → ASSERTS  → RelFact
+
+    Write path uses ``_plugins/_graph/docgraph/{db}/_ingest`` and ``_extract``.
+    Read path uses evidence-mediated Cypher (all Entity/RelFact access goes
+    through Chunk).
+    """
+
+    # Buffers for batched docgraph _extract calls
+    _pending_entities: dict = field(default_factory=dict, repr=False, init=False)
+    _pending_relations: dict = field(default_factory=dict, repr=False, init=False)
+    _known_chunks: set = field(default_factory=set, repr=False, init=False)
+    _known_docs: set = field(default_factory=set, repr=False, init=False)
+
+    # ── Database lifecycle (override: docgraph mode) ─────────────────────
+
+    async def _ensure_session(self):
+        if self._database_ready:
+            return
+        if self._client is None:
+            self._client = _create_os_client()
+        dim = self.embedding_func.embedding_dim if self.embedding_func else 1024
+        db_body = {
+            "mode": "docgraph",
+            "embedding": {
+                "dimension": dim, "field": "embedding",
+                "engine": "faiss", "space_type": "cosinesimil",
+            },
+            "schema": {
+                "nodes": {
+                    "entity_id": {"type": "keyword"},
+                    "entity_type": {"type": "keyword"},
+                    "description": {"type": "text"},
+                },
+                "edges": {
+                    "weight": {"type": "float"},
+                    "description": {"type": "text"},
+                    "keywords": {"type": "text"},
+                },
+                "strict": False,
+            },
+        }
+        try:
+            await self._client.transport.perform_request(
+                "PUT", f"/_plugins/_graph/database/{self._database_name}", body=db_body,
+            )
+            logger.info(f"Created docgraph database: {self._database_name}")
+        except Exception as e:
+            err = str(e).lower()
+            if any(k in err for k in ("already exists", "already_exists", "resource_already_exists", "creation failed")):
+                logger.debug(f"Docgraph database already exists: {self._database_name}")
+            else:
+                raise
+        self._database_ready = True
+        logger.info(f"OpenSearch docgraph storage ready (db={self._database_name})")
+
+    # ── Docgraph REST helpers ────────────────────────────────────────────
+
+    async def _docgraph_request(self, action: str, body: dict) -> dict:
+        """POST _plugins/_graph/docgraph/{db}/{action}"""
+        import asyncio as _aio
+        for attempt in range(3):
+            try:
+                return await self._client.transport.perform_request(
+                    "POST",
+                    f"/_plugins/_graph/docgraph/{self._database_name}/{action}",
+                    body=body,
+                )
+            except Exception as e:
+                if attempt < 2:
+                    await _aio.sleep(2 ** attempt)
+                else:
+                    logger.error(f"Docgraph {action} failed after 3 attempts: {e}")
+                    raise
+
+    async def _ensure_doc_and_chunk(self, chunk_id: str, doc_id: str | None = None):
+        """Ensure Document and Chunk nodes exist via docgraph upsert APIs."""
+        if doc_id and doc_id not in self._known_docs:
+            await self._docgraph_request("_upsert_document", {
+                "document_id": doc_id,
+                "authz_claims": _default_authz_claims(),
+            })
+            self._known_docs.add(doc_id)
+
+        if chunk_id not in self._known_chunks:
+            body = {
+                "chunk_id": chunk_id,
+                "document_id": doc_id or "unknown",
+                "authz_claims": _default_authz_claims(),
+            }
+            await self._docgraph_request("_upsert_chunk", body)
+            self._known_chunks.add(chunk_id)
+
+    # ── Write path (buffered → _extract) ─────────────────────────────────
+
+    async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
+        await self._ensure_session()
+        node_id = self._clean_id(node_id)
+        if not node_id:
+            return
+
+        # Parse source_id to get chunk keys
+        source_id = node_data.get("source_id", "")
+        chunk_ids = [c.strip() for c in source_id.split("<SEP>") if c.strip()] if source_id else ["unknown"]
+
+        entity_obj = {
+            "entity_id": node_id,
+            "labels": ["Entity"],
+            "properties": {
+                "entity_id": node_id,
+                "entity_type": node_data.get("entity_type", ""),
+                "description": node_data.get("description", ""),
+                "source_id": source_id,
+            },
+        }
+
+        for cid in chunk_ids:
+            self._pending_entities.setdefault(cid, {})[node_id] = entity_obj
+
+    async def upsert_edge(
+        self, source_node_id: str, target_node_id: str, edge_data: dict[str, str],
+    ) -> None:
+        await self._ensure_session()
+        source_node_id = self._clean_id(source_node_id)
+        target_node_id = self._clean_id(target_node_id)
+        if not source_node_id or not target_node_id:
+            return
+
+        source_id = edge_data.get("source_id", "")
+        chunk_ids = [c.strip() for c in source_id.split("<SEP>") if c.strip()] if source_id else ["unknown"]
+
+        weight = edge_data.get("weight", 1.0)
+        try:
+            weight = float(weight)
+        except (ValueError, TypeError):
+            weight = 1.0
+
+        rel_id = f"{source_node_id}--{target_node_id}"
+        rel_obj = {
+            "relation_id": rel_id,
+            "type": "DIRECTED",
+            "source_entity_id": source_node_id,
+            "target_entity_id": target_node_id,
+            "properties": {
+                "weight": weight,
+                "description": edge_data.get("description", ""),
+                "keywords": edge_data.get("keywords", ""),
+                "source_id": source_id,
+            },
+        }
+
+        for cid in chunk_ids:
+            self._pending_relations.setdefault(cid, {})[rel_id] = rel_obj
+
+    async def _flush_pending(self):
+        """Flush all buffered entities/relations via docgraph _extract."""
+        all_chunk_ids = set(self._pending_entities.keys()) | set(self._pending_relations.keys())
+        for cid in all_chunk_ids:
+            await self._ensure_doc_and_chunk(cid)
+            entities = list(self._pending_entities.get(cid, {}).values())
+            relations = list(self._pending_relations.get(cid, {}).values())
+            if entities or relations:
+                await self._docgraph_request("_extract", {
+                    "chunk_id": cid,
+                    "entities": entities,
+                    "relations": relations,
+                })
+        self._pending_entities.clear()
+        self._pending_relations.clear()
+
+    async def index_done_callback(self) -> None:
+        await self._ensure_session()
+        await self._flush_pending()
+        try:
+            await self._client.indices.refresh(index=f"{self._database_name}-lpg-nodes")
+        except Exception:
+            pass
+        try:
+            await self._client.indices.refresh(index=f"{self._database_name}-lpg-edges")
+        except Exception:
+            pass
+
+    # ── Read path (evidence-mediated queries) ────────────────────────────
+
+    async def has_node(self, node_id: str) -> bool:
+        await self._ensure_session()
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (c:Chunk)-[:MENTIONS]->(n:Entity {entity_id: $id}) "
+                "RETURN count(n) > 0 AS exists",
+                {"id": self._clean_id(node_id)},
+            )
+            rows = self._rows(resp)
+            return bool(rows[0][0]) if rows else False
+        except Exception:
+            return False
+
+    async def get_node(self, node_id: str) -> Union[dict, None]:
+        await self._ensure_session()
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (c:Chunk)-[:MENTIONS]->(n:Entity {entity_id: $id}) "
+                "RETURN properties(n) AS props LIMIT 1",
+                {"id": self._clean_id(node_id)},
+            )
+            rows = self._rows(resp)
+            if rows and rows[0][0]:
+                props = rows[0][0]
+                props.pop("embedding", None)
+                return props
+            return None
+        except Exception:
+            return None
+
+    async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
+        await self._ensure_session()
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (c:Chunk)-[:ASSERTS]->(rf:RelFact)"
+                "-[:SOURCE_ENTITY]->(a:Entity {entity_id: $src}) "
+                "MATCH (rf)-[:TARGET_ENTITY]->(b:Entity {entity_id: $tgt}) "
+                "RETURN count(rf) > 0 AS exists",
+                {"src": self._clean_id(source_node_id), "tgt": self._clean_id(target_node_id)},
+            )
+            rows = self._rows(resp)
+            return bool(rows[0][0]) if rows else False
+        except Exception:
+            return False
+
+    async def get_edge(
+        self, source_node_id: str, target_node_id: str
+    ) -> Union[dict, None]:
+        await self._ensure_session()
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (c:Chunk)-[:ASSERTS]->(rf:RelFact)"
+                "-[:SOURCE_ENTITY]->(a:Entity {entity_id: $src}) "
+                "MATCH (rf)-[:TARGET_ENTITY]->(b:Entity {entity_id: $tgt}) "
+                "RETURN properties(rf) AS props LIMIT 1",
+                {"src": self._clean_id(source_node_id), "tgt": self._clean_id(target_node_id)},
+            )
+            rows = self._rows(resp)
+            return rows[0][0] if rows else None
+        except Exception:
+            return None
+
+    async def node_degree(self, node_id: str) -> int:
+        await self._ensure_session()
+        try:
+            # Count RelFacts where this entity is source or target
+            resp = await self._execute_cypher(
+                "MATCH (c:Chunk)-[:ASSERTS]->(rf:RelFact)-[:SOURCE_ENTITY]->(n:Entity {entity_id: $id}) "
+                "RETURN count(rf) AS deg",
+                {"id": self._clean_id(node_id)},
+            )
+            rows_src = self._rows(resp)
+            deg_src = int(rows_src[0][0]) if rows_src else 0
+
+            resp2 = await self._execute_cypher(
+                "MATCH (c:Chunk)-[:ASSERTS]->(rf:RelFact)-[:TARGET_ENTITY]->(n:Entity {entity_id: $id}) "
+                "RETURN count(rf) AS deg",
+                {"id": self._clean_id(node_id)},
+            )
+            rows_tgt = self._rows(resp2)
+            deg_tgt = int(rows_tgt[0][0]) if rows_tgt else 0
+
+            return deg_src + deg_tgt
+        except Exception:
+            return 0
+
+    async def get_node_edges(
+        self, source_node_id: str
+    ) -> Union[list[tuple[str, str]], None]:
+        await self._ensure_session()
+        try:
+            clean_id = self._clean_id(source_node_id)
+            # Edges where this entity is the source
+            resp1 = await self._execute_cypher(
+                "MATCH (c:Chunk)-[:ASSERTS]->(rf:RelFact)"
+                "-[:SOURCE_ENTITY]->(a:Entity {entity_id: $id}) "
+                "MATCH (rf)-[:TARGET_ENTITY]->(b:Entity) "
+                "RETURN a.entity_id AS src, b.entity_id AS tgt",
+                {"id": clean_id},
+            )
+            # Edges where this entity is the target
+            resp2 = await self._execute_cypher(
+                "MATCH (c:Chunk)-[:ASSERTS]->(rf:RelFact)"
+                "-[:TARGET_ENTITY]->(a:Entity {entity_id: $id}) "
+                "MATCH (rf)-[:SOURCE_ENTITY]->(b:Entity) "
+                "RETURN b.entity_id AS src, a.entity_id AS tgt",
+                {"id": clean_id},
+            )
+            edges = []
+            for r in self._rows(resp1):
+                edges.append((r[0], r[1]))
+            for r in self._rows(resp2):
+                edges.append((r[0], r[1]))
+            return edges if edges else None
+        except Exception:
+            return None
+
+    async def get_types(self) -> tuple[list[str], list[str]]:
+        await self._ensure_session()
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (c:Chunk)-[:MENTIONS]->(n:Entity) "
+                "RETURN DISTINCT n.entity_type AS t"
+            )
+            original = [r[0] for r in self._rows(resp) if r[0]]
+            lowered = [t.lower() for t in original]
+            return lowered, original
+        except Exception:
+            return [], []
+
+    async def get_node_from_types(self, type_list) -> list[dict]:
+        await self._ensure_session()
+        if not type_list:
+            return []
+        try:
+            resp = await self._execute_cypher(
+                "MATCH (c:Chunk)-[:MENTIONS]->(n:Entity) "
+                "WHERE n.entity_type IN $types "
+                "RETURN n.entity_id AS eid, properties(n) AS props",
+                {"types": list(type_list)},
+            )
+            result = []
+            for row in self._rows(resp):
+                props = row[1] or {}
+                props.pop("embedding", None)
+                result.append({**props, "entity_name": row[0]})
+            return result
+        except Exception:
+            return []
+
+    # ── Delete path ──────────────────────────────────────────────────────
+
+    async def delete_node(self, node_id: str) -> None:
+        """Withdraw documents that sourced this entity, or fall back to Cypher."""
+        await self._ensure_session()
+        try:
+            # Find source documents for this entity via evidence chain
+            resp = await self._execute_cypher(
+                "MATCH (d:Document)-[:HAS_CHUNK]->(c:Chunk)-[:MENTIONS]->(n:Entity {entity_id: $id}) "
+                "RETURN DISTINCT d.id AS doc_id",
+                {"id": self._clean_id(node_id)},
+            )
+            doc_ids = [r[0] for r in self._rows(resp) if r[0]]
+            for doc_id in doc_ids:
+                try:
+                    await self._docgraph_request("_withdraw_document", {"document_id": doc_id})
+                except Exception as e:
+                    logger.warning(f"Failed to withdraw document {doc_id}: {e}")
+        except Exception as e:
+            logger.error(f"Error deleting node {node_id}: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Document status storage backend using OpenSearch
 # ═══════════════════════════════════════════════════════════════════════════
 

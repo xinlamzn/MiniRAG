@@ -66,6 +66,7 @@ STORAGES = {
     "OpenSearchKVStorage": ".kg.opensearch_impl",
     "OpenSearchVectorStorage": ".kg.opensearch_impl",
     "OpenSearchGraphStorage": ".kg.opensearch_impl",
+    "OpenSearchDocgraphStorage": ".kg.opensearch_impl",
     "OpenSearchDocStatusStorage": ".kg.opensearch_impl",
 }
 
