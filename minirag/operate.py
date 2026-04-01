@@ -147,7 +147,7 @@ async def _merge_nodes_then_upsert(
         sorted(set([dp["description"] for dp in nodes_data] + already_description))
     )
     source_id = GRAPH_FIELD_SEP.join(
-        set([dp["source_id"] for dp in nodes_data] + already_source_ids)
+        set([dp.get("source_id", "") for dp in nodes_data] + already_source_ids)
     )
 
     # description = await _handle_entity_relation_summary(
@@ -197,7 +197,7 @@ async def _merge_edges_then_upsert(
         sorted(set([dp["keywords"] for dp in edges_data] + already_keywords))
     )
     source_id = GRAPH_FIELD_SEP.join(
-        set([dp["source_id"] for dp in edges_data] + already_source_ids)
+        set([dp.get("source_id", "") for dp in edges_data] + already_source_ids)
     )
     for need_insert_id in [src_id, tgt_id]:
         if not (await knowledge_graph_inst.has_node(need_insert_id)):
@@ -583,7 +583,7 @@ async def _find_most_related_text_unit_from_entities(
     knowledge_graph_inst: BaseGraphStorage,
 ):
     text_units = [
-        split_string_by_multi_markers(dp["source_id"], [GRAPH_FIELD_SEP])
+        split_string_by_multi_markers(dp.get("source_id", ""), [GRAPH_FIELD_SEP])
         for dp in node_datas
     ]
     edges = await asyncio.gather(
@@ -898,7 +898,7 @@ async def _find_related_text_unit_from_relationships(
     knowledge_graph_inst: BaseGraphStorage,
 ):
     text_units = [
-        split_string_by_multi_markers(dp["source_id"], [GRAPH_FIELD_SEP])
+        split_string_by_multi_markers(dp.get("source_id", ""), [GRAPH_FIELD_SEP])
         for dp in edge_datas
     ]
 
@@ -1149,7 +1149,7 @@ async def path2chunk(
                     *[knowledge_graph_inst.get_edge(r[0], r[1]) for r in use_edge]
                 )
                 text_units = [
-                    split_string_by_multi_markers(dp["source_id"], [GRAPH_FIELD_SEP])
+                    split_string_by_multi_markers(dp.get("source_id", ""), [GRAPH_FIELD_SEP])
                     for dp in edge_datas if dp is not None  # chunk ID
                 ]
                 text_units = text_units[0] if text_units else []
@@ -1165,7 +1165,7 @@ async def path2chunk(
                 if dp is None:
                     continue
                 text_units_node = split_string_by_multi_markers(
-                    dp["source_id"], [GRAPH_FIELD_SEP]
+                    dp.get("source_id", ""), [GRAPH_FIELD_SEP]
                 )
                 text_units = text_units + text_units_node
 
@@ -1177,7 +1177,7 @@ async def path2chunk(
                     if dp is None:
                         continue
                     text_units_node = split_string_by_multi_markers(
-                        dp["source_id"], [GRAPH_FIELD_SEP]
+                        dp.get("source_id", ""), [GRAPH_FIELD_SEP]
                     )
                     descriptionlist_node = split_string_by_multi_markers(
                         dp["description"], [GRAPH_FIELD_SEP]
@@ -1215,7 +1215,7 @@ async def path2chunk(
                 if dp is None:
                     continue
                 text_units_node = split_string_by_multi_markers(
-                    dp["source_id"], [GRAPH_FIELD_SEP]
+                    dp.get("source_id", ""), [GRAPH_FIELD_SEP]
                 )
                 count_dict = Counter(text_units_node)
 

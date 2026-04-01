@@ -962,7 +962,7 @@ class OpenSearchGraphStorage(BaseGraphStorage):
 
 def _default_authz_claims() -> dict:
     """Default authz claims for docgraph ingest (no real auth in MiniRAG)."""
-    return {"backend_roles": ["minirag"]}
+    return {"backend_roles": [os.environ.get("OPENSEARCH_AUTHZ_ROLE", "admin")]}
 
 
 @dataclass
@@ -1031,14 +1031,14 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
     async def _docgraph_request(self, action: str, body: dict) -> dict:
         """POST _plugins/_graph/docgraph/{db}/{action}"""
         import asyncio as _aio
+        path = f"/_plugins/_graph/docgraph/{self._database_name}/{action}"
         for attempt in range(3):
             try:
                 return await self._client.transport.perform_request(
-                    "POST",
-                    f"/_plugins/_graph/docgraph/{self._database_name}/{action}",
-                    body=body,
+                    "POST", path, body=body,
                 )
             except Exception as e:
+                logger.warning(f"Docgraph {action} attempt {attempt+1} failed: {e}")
                 if attempt < 2:
                     await _aio.sleep(2 ** attempt)
                 else:
@@ -1047,7 +1047,11 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
 
     async def _ensure_doc_and_chunk(self, chunk_id: str, doc_id: str | None = None):
         """Ensure Document and Chunk nodes exist via docgraph upsert APIs."""
-        if doc_id and doc_id not in self._known_docs:
+        # Use a default document if none provided
+        if not doc_id:
+            doc_id = "default"
+
+        if doc_id not in self._known_docs:
             await self._docgraph_request("_upsert_document", {
                 "document_id": doc_id,
                 "authz_claims": _default_authz_claims(),
@@ -1055,12 +1059,11 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
             self._known_docs.add(doc_id)
 
         if chunk_id not in self._known_chunks:
-            body = {
+            await self._docgraph_request("_upsert_chunk", {
                 "chunk_id": chunk_id,
-                "document_id": doc_id or "unknown",
+                "document_id": doc_id,
                 "authz_claims": _default_authz_claims(),
-            }
-            await self._docgraph_request("_upsert_chunk", body)
+            })
             self._known_chunks.add(chunk_id)
 
     # ── Write path (buffered → _extract) ─────────────────────────────────
@@ -1158,7 +1161,8 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
         await self._ensure_session()
         try:
             resp = await self._execute_cypher(
-                "MATCH (c:Chunk)-[:MENTIONS]->(n:Entity {entity_id: $id}) "
+                "MATCH (c:Chunk)-[:MENTIONS]->(n:Entity) "
+                "WHERE n.entity_id = $id "
                 "RETURN count(n) > 0 AS exists",
                 {"id": self._clean_id(node_id)},
             )
@@ -1171,7 +1175,8 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
         await self._ensure_session()
         try:
             resp = await self._execute_cypher(
-                "MATCH (c:Chunk)-[:MENTIONS]->(n:Entity {entity_id: $id}) "
+                "MATCH (c:Chunk)-[:MENTIONS]->(n:Entity) "
+                "WHERE n.entity_id = $id "
                 "RETURN properties(n) AS props LIMIT 1",
                 {"id": self._clean_id(node_id)},
             )
@@ -1189,8 +1194,9 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
         try:
             resp = await self._execute_cypher(
                 "MATCH (c:Chunk)-[:ASSERTS]->(rf:RelFact)"
-                "-[:SOURCE_ENTITY]->(a:Entity {entity_id: $src}) "
-                "MATCH (rf)-[:TARGET_ENTITY]->(b:Entity {entity_id: $tgt}) "
+                "-[:SOURCE_ENTITY]->(a:Entity), "
+                "(rf)-[:TARGET_ENTITY]->(b:Entity) "
+                "WHERE a.entity_id = $src AND b.entity_id = $tgt "
                 "RETURN count(rf) > 0 AS exists",
                 {"src": self._clean_id(source_node_id), "tgt": self._clean_id(target_node_id)},
             )
@@ -1206,8 +1212,9 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
         try:
             resp = await self._execute_cypher(
                 "MATCH (c:Chunk)-[:ASSERTS]->(rf:RelFact)"
-                "-[:SOURCE_ENTITY]->(a:Entity {entity_id: $src}) "
-                "MATCH (rf)-[:TARGET_ENTITY]->(b:Entity {entity_id: $tgt}) "
+                "-[:SOURCE_ENTITY]->(a:Entity), "
+                "(rf)-[:TARGET_ENTITY]->(b:Entity) "
+                "WHERE a.entity_id = $src AND b.entity_id = $tgt "
                 "RETURN properties(rf) AS props LIMIT 1",
                 {"src": self._clean_id(source_node_id), "tgt": self._clean_id(target_node_id)},
             )
@@ -1219,9 +1226,9 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
     async def node_degree(self, node_id: str) -> int:
         await self._ensure_session()
         try:
-            # Count RelFacts where this entity is source or target
             resp = await self._execute_cypher(
-                "MATCH (c:Chunk)-[:ASSERTS]->(rf:RelFact)-[:SOURCE_ENTITY]->(n:Entity {entity_id: $id}) "
+                "MATCH (c:Chunk)-[:ASSERTS]->(rf:RelFact)-[:SOURCE_ENTITY]->(n:Entity) "
+                "WHERE n.entity_id = $id "
                 "RETURN count(rf) AS deg",
                 {"id": self._clean_id(node_id)},
             )
@@ -1229,7 +1236,8 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
             deg_src = int(rows_src[0][0]) if rows_src else 0
 
             resp2 = await self._execute_cypher(
-                "MATCH (c:Chunk)-[:ASSERTS]->(rf:RelFact)-[:TARGET_ENTITY]->(n:Entity {entity_id: $id}) "
+                "MATCH (c:Chunk)-[:ASSERTS]->(rf:RelFact)-[:TARGET_ENTITY]->(n:Entity) "
+                "WHERE n.entity_id = $id "
                 "RETURN count(rf) AS deg",
                 {"id": self._clean_id(node_id)},
             )
@@ -1246,19 +1254,19 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
         await self._ensure_session()
         try:
             clean_id = self._clean_id(source_node_id)
-            # Edges where this entity is the source
             resp1 = await self._execute_cypher(
                 "MATCH (c:Chunk)-[:ASSERTS]->(rf:RelFact)"
-                "-[:SOURCE_ENTITY]->(a:Entity {entity_id: $id}) "
-                "MATCH (rf)-[:TARGET_ENTITY]->(b:Entity) "
+                "-[:SOURCE_ENTITY]->(a:Entity), "
+                "(rf)-[:TARGET_ENTITY]->(b:Entity) "
+                "WHERE a.entity_id = $id "
                 "RETURN a.entity_id AS src, b.entity_id AS tgt",
                 {"id": clean_id},
             )
-            # Edges where this entity is the target
             resp2 = await self._execute_cypher(
                 "MATCH (c:Chunk)-[:ASSERTS]->(rf:RelFact)"
-                "-[:TARGET_ENTITY]->(a:Entity {entity_id: $id}) "
-                "MATCH (rf)-[:SOURCE_ENTITY]->(b:Entity) "
+                "-[:TARGET_ENTITY]->(a:Entity), "
+                "(rf)-[:SOURCE_ENTITY]->(b:Entity) "
+                "WHERE a.entity_id = $id "
                 "RETURN b.entity_id AS src, a.entity_id AS tgt",
                 {"id": clean_id},
             )
@@ -1312,7 +1320,8 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
         try:
             # Find source documents for this entity via evidence chain
             resp = await self._execute_cypher(
-                "MATCH (d:Document)-[:HAS_CHUNK]->(c:Chunk)-[:MENTIONS]->(n:Entity {entity_id: $id}) "
+                "MATCH (d:Document)-[:HAS_CHUNK]->(c:Chunk)-[:MENTIONS]->(n:Entity) "
+                "WHERE n.entity_id = $id "
                 "RETURN DISTINCT d.id AS doc_id",
                 {"id": self._clean_id(node_id)},
             )

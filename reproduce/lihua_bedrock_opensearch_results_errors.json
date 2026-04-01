@@ -1,0 +1,22 @@
+[
+  {
+    "question": "Did Jennifer remind Li Hua about proper nutrition and hydration before Jake shared his tips for staying hydrated during the match?",
+    "error": "'NoneType' object is not a mapping"
+  },
+  {
+    "question": "Did the group members talk about their favorite characters in the TV series Game of Thrones after Emily started a vote on the most hateable character?",
+    "error": "'NoneType' object is not a mapping"
+  },
+  {
+    "question": "When did Li Hua invite Adam Smith to check the basement renovation progress?",
+    "error": "'list' object has no attribute 'get'"
+  },
+  {
+    "question": "What does Elara enjoy doing to unwind after intense battles in games?",
+    "error": "'list' object has no attribute 'get'"
+  },
+  {
+    "question": "What type of protein shake does Li Hua prefer to drink before his workout sessions?",
+    "error": "'NoneType' object is not a mapping"
+  }
+]
