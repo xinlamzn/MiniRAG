@@ -131,7 +131,7 @@ async def _merge_nodes_then_upsert(
     if already_node is not None:
         already_entitiy_types.append(already_node["entity_type"])
         already_source_ids.extend(
-            split_string_by_multi_markers(already_node["source_id"], [GRAPH_FIELD_SEP])
+            split_string_by_multi_markers(already_node.get("source_id", ""), [GRAPH_FIELD_SEP])
         )
         already_description.append(already_node["description"])
 
@@ -182,7 +182,7 @@ async def _merge_edges_then_upsert(
         already_edge = await knowledge_graph_inst.get_edge(src_id, tgt_id)
         already_weights.append(already_edge["weight"])
         already_source_ids.extend(
-            split_string_by_multi_markers(already_edge["source_id"], [GRAPH_FIELD_SEP])
+            split_string_by_multi_markers(already_edge.get("source_id", ""), [GRAPH_FIELD_SEP])
         )
         already_description.append(already_edge["description"])
         already_keywords.extend(
@@ -602,7 +602,7 @@ async def _find_most_related_text_unit_from_entities(
 
     # Add null check for node data
     all_one_hop_text_units_lookup = {
-        k: set(split_string_by_multi_markers(v["source_id"], [GRAPH_FIELD_SEP]))
+        k: set(split_string_by_multi_markers(v.get("source_id", ""), [GRAPH_FIELD_SEP]))
         for k, v in zip(all_one_hop_nodes, all_one_hop_nodes_data)
         if v is not None and "source_id" in v  # Add source_id check
     }
