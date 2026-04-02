@@ -1370,7 +1370,7 @@ async def _build_mini_query_context(
         ]
     )
     node_datas = [
-        {**n, "entity_name": k, "Score": scored_edged_reasoning_path[k]["Score"]}
+        {**(n or {}), "entity_name": k, "Score": scored_edged_reasoning_path[k]["Score"]}
         for k, n in zip(scored_edged_reasoning_path.keys(), node_datas)
     ]
     for i, n in enumerate(node_datas):
