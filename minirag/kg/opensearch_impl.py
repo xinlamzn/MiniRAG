@@ -1038,11 +1038,12 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
                     "POST", path, body=body,
                 )
             except Exception as e:
-                logger.warning(f"Docgraph {action} attempt {attempt+1} failed: {e}")
+                info = getattr(e, 'info', None) or str(e)
+                logger.warning(f"Docgraph {action} attempt {attempt+1}: {info}")
                 if attempt < 2:
                     await _aio.sleep(2 ** attempt)
                 else:
-                    logger.error(f"Docgraph {action} failed after 3 attempts: {e}")
+                    logger.error(f"Docgraph {action} failed: {info}")
                     raise
 
     async def _ensure_doc_and_chunk(self, chunk_id: str, doc_id: str | None = None):
@@ -1130,8 +1131,16 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
     async def _flush_pending(self):
         """Flush all buffered entities/relations via docgraph _extract."""
         all_chunk_ids = set(self._pending_entities.keys()) | set(self._pending_relations.keys())
+        # Create all docs and chunks first
         for cid in all_chunk_ids:
             await self._ensure_doc_and_chunk(cid)
+        # Refresh so chunks are visible to _extract
+        try:
+            await self._client.indices.refresh(index=f"{self._database_name}-lpg-nodes")
+        except Exception:
+            pass
+        # Now extract entities/relations
+        for cid in all_chunk_ids:
             entities = list(self._pending_entities.get(cid, {}).values())
             relations = list(self._pending_relations.get(cid, {}).values())
             if entities or relations:
