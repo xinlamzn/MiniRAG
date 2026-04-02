@@ -129,11 +129,11 @@ async def _merge_nodes_then_upsert(
 
     already_node = await knowledge_graph_inst.get_node(entity_name)
     if already_node is not None:
-        already_entitiy_types.append(already_node["entity_type"])
+        already_entitiy_types.append(already_node.get("entity_type", ""))
         already_source_ids.extend(
             split_string_by_multi_markers(already_node.get("source_id", ""), [GRAPH_FIELD_SEP])
         )
-        already_description.append(already_node["description"])
+        already_description.append(already_node.get("description", ""))
 
     entity_type = sorted(
         Counter(
@@ -180,13 +180,13 @@ async def _merge_edges_then_upsert(
 
     if await knowledge_graph_inst.has_edge(src_id, tgt_id):
         already_edge = await knowledge_graph_inst.get_edge(src_id, tgt_id)
-        already_weights.append(already_edge["weight"])
+        already_weights.append(already_edge.get("weight", 1.0))
         already_source_ids.extend(
             split_string_by_multi_markers(already_edge.get("source_id", ""), [GRAPH_FIELD_SEP])
         )
-        already_description.append(already_edge["description"])
+        already_description.append(already_edge.get("description", ""))
         already_keywords.extend(
-            split_string_by_multi_markers(already_edge["keywords"], [GRAPH_FIELD_SEP])
+            split_string_by_multi_markers(already_edge.get("keywords", ""), [GRAPH_FIELD_SEP])
         )
 
     weight = sum([dp["weight"] for dp in edges_data] + already_weights)
