@@ -1133,7 +1133,10 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
         all_chunk_ids = set(self._pending_entities.keys()) | set(self._pending_relations.keys())
         # Create all docs and chunks first
         for cid in all_chunk_ids:
-            await self._ensure_doc_and_chunk(cid)
+            try:
+                await self._ensure_doc_and_chunk(cid)
+            except Exception as e:
+                logger.warning(f"Failed to create chunk {cid}: {e}")
         # Refresh so chunks are visible to _extract
         try:
             await self._client.indices.refresh(index=f"{self._database_name}-lpg-nodes")
@@ -1144,11 +1147,14 @@ class OpenSearchDocgraphStorage(OpenSearchGraphStorage):
             entities = list(self._pending_entities.get(cid, {}).values())
             relations = list(self._pending_relations.get(cid, {}).values())
             if entities or relations:
-                await self._docgraph_request("_extract", {
-                    "chunk_id": cid,
-                    "entities": entities,
-                    "relations": relations,
-                })
+                try:
+                    await self._docgraph_request("_extract", {
+                        "chunk_id": cid,
+                        "entities": entities,
+                        "relations": relations,
+                    })
+                except Exception as e:
+                    logger.warning(f"Failed to extract for chunk {cid}: {e}")
         self._pending_entities.clear()
         self._pending_relations.clear()
 
